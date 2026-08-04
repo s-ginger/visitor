@@ -2,7 +2,6 @@ import argparse
 import signal
 import sys
 import time
-from pathlib import Path
 
 from recorder import Recorder
 
@@ -26,9 +25,9 @@ def main() -> None:
     args = parser.parse_args()
 
     recorder = Recorder(data_dir=args.data_dir, tick_interval=args.tick_interval)
-    session_dir = recorder.start()
+    data_dir = recorder.start()
 
-    print(f"Recording started. Session: {session_dir}")
+    print(f"Recording started. Data dir: {data_dir}")
     print("Press Ctrl+C to stop.")
 
     def shutdown(signum, frame):

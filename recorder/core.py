@@ -1,11 +1,11 @@
 import io
-import json
-import tarfile
 import time
 import threading
 from pathlib import Path
 from datetime import datetime
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 from PIL import Image
 
 import mss
@@ -14,6 +14,7 @@ from pynput import mouse, keyboard
 
 SCREENSHOT_WIDTH = 1024
 SCREENSHOT_HEIGHT = 576
+CHUNK_SIZE = 1000
 
 
 class Recorder:
@@ -21,29 +22,20 @@ class Recorder:
         self.data_dir = Path(data_dir)
         self.tick_interval = tick_interval
         self._running = False
-        self._session_dir: Path | None = None
-        self._events_file: Path | None = None
-        self._screenshots_tar: Path | None = None
-        self._tar: tarfile.TarFile | None = None
-        self._tick_thread: threading.Thread | None = None
-        self._sct = mss.mss()
+        self._sct = mss.MSS()
         self._lock = threading.Lock()
         self._events: list[dict] = []
         self._mouse_listener: mouse.Listener | None = None
         self._keyboard_listener: keyboard.Listener | None = None
-
-    @property
-    def session_dir(self) -> Path | None:
-        return self._session_dir
+        self._tick_thread: threading.Thread | None = None
+        self._mouse_x: int = 0
+        self._mouse_y: int = 0
+        self._mouse_left: bool = False
+        self._mouse_right: bool = False
+        self._keys: dict[str, bool] = {}
 
     def start(self) -> Path:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_dir = self.data_dir / "sessions" / f"session_{ts}"
-        self._session_dir.mkdir(parents=True, exist_ok=True)
-        self._events_file = self._session_dir / "events.jsonl"
-        self._screenshots_tar = self._session_dir / "screenshots.tar"
-        self._tar = tarfile.open(self._screenshots_tar, "a:")
-
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self._running = True
 
         self._mouse_listener = mouse.Listener(
@@ -61,7 +53,7 @@ class Recorder:
         self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True)
         self._tick_thread.start()
 
-        return self._session_dir
+        return self.data_dir
 
     def stop(self) -> None:
         self._running = False
@@ -71,10 +63,7 @@ class Recorder:
             self._mouse_listener.stop()
         if self._keyboard_listener is not None:
             self._keyboard_listener.stop()
-        if self._tar is not None:
-            self._tar.close()
-            self._tar = None
-        self._flush_events()
+        self._flush_events(final=True)
         self._sct.close()
 
     def _tick_loop(self) -> None:
@@ -84,79 +73,64 @@ class Recorder:
 
     def _tick(self) -> None:
         ts = time.time()
-        screenshot_path = self._capture_screenshot(ts)
+        img_bytes = self._capture_screenshot()
         event = {
+            "image": img_bytes,
             "timestamp": ts,
-            "event_type": "tick",
-            "mouse": None,
-            "keyboard": None,
-            "screenshot_path": screenshot_path,
+            "mouse_x": self._mouse_x,
+            "mouse_y": self._mouse_y,
+            "mouse_left": self._mouse_left,
+            "mouse_right": self._mouse_right,
+            "key_w": self._keys.get("w", False),
+            "key_a": self._keys.get("a", False),
+            "key_s": self._keys.get("s", False),
+            "key_d": self._keys.get("d", False),
+            "key_space": self._keys.get("Key.space", False),
+            "key_shift": self._keys.get("Key.shift", False),
+            "key_ctrl": self._keys.get("Key.ctrl", False),
         }
-        self._write_event(event)
+        with self._lock:
+            self._events.append(event)
+        if len(self._events) >= CHUNK_SIZE:
+            self._flush_events()
 
-    def _capture_screenshot(self, ts: float) -> str:
+    def _capture_screenshot(self) -> bytes:
         monitor = self._sct.monitors[1]
         sct_img = self._sct.grab(monitor)
-        filename = f"{int(ts * 1000)}.webp"
         img = Image.frombytes("RGB", sct_img.size, sct_img.rgb)
         img = img.resize(
             (SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT), Image.Resampling.LANCZOS
         )
         buf = io.BytesIO()
-        img.save(buf, format="WEBP",quality=75, method=6, )
-        buf.seek(0)
-        info = tarfile.TarInfo(f"screenshots/{filename}")
-        info.size = buf.getbuffer().nbytes
-        self._tar.addfile(info, buf)
-        return f"screenshots/{filename}"
+        img.save(buf, format="WEBP", quality=85)
+        return buf.getvalue()
 
     def _on_mouse_move(self, x: int, y: int) -> None:
-        event = {
-            "timestamp": time.time(),
-            "event_type": "mouse_move",
-            "mouse": {"x": x, "y": y, "button": None, "pressed": False},
-            "keyboard": None,
-            "screenshot_path": None,
-        }
-        self._write_event(event)
+        self._mouse_x = x
+        self._mouse_y = y
 
-    def _on_mouse_click(self, x: int, y: int, button: mouse.Button, pressed: bool) -> None:
-        event = {
-            "timestamp": time.time(),
-            "event_type": "mouse_click",
-            "mouse": {
-                "x": x,
-                "y": y,
-                "button": button.name,
-                "pressed": pressed,
-            },
-            "keyboard": None,
-            "screenshot_path": None,
-        }
-        self._write_event(event)
+    def _on_mouse_click(
+        self, x: int, y: int, button: mouse.Button, pressed: bool
+    ) -> None:
+        self._mouse_x = x
+        self._mouse_y = y
+        if button == mouse.Button.left:
+            self._mouse_left = pressed
+        elif button == mouse.Button.right:
+            self._mouse_right = pressed
 
     def _on_key_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        event = {
-            "timestamp": time.time(),
-            "event_type": "key_press",
-            "mouse": None,
-            "keyboard": {"key": self._format_key(key)},
-            "screenshot_path": None,
-        }
-        self._write_event(event)
+        name = self._key_name(key)
+        if name:
+            self._keys[name] = True
 
     def _on_key_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        event = {
-            "timestamp": time.time(),
-            "event_type": "key_release",
-            "mouse": None,
-            "keyboard": {"key": self._format_key(key)},
-            "screenshot_path": None,
-        }
-        self._write_event(event)
+        name = self._key_name(key)
+        if name:
+            self._keys[name] = False
 
     @staticmethod
-    def _format_key(key: keyboard.Key | keyboard.KeyCode | None) -> str | None:
+    def _key_name(key: keyboard.Key | keyboard.KeyCode | None) -> str | None:
         if key is None:
             return None
         if isinstance(key, keyboard.Key):
@@ -165,16 +139,59 @@ class Recorder:
             return key.char if key.char else str(key)
         return str(key)
 
-    def _write_event(self, event: dict) -> None:
+    def _flush_events(self, final: bool = False) -> None:
         with self._lock:
-            self._events.append(event)
-
-    def _flush_events(self) -> None:
-        if not self._events_file or not self._events:
-            return
-        with self._lock:
+            if not self._events:
+                return
             events = self._events
             self._events = []
-        with open(self._events_file, "a", encoding="utf-8") as f:
-            for ev in events:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+        for i in range(0, len(events), CHUNK_SIZE):
+            chunk = events[i : i + CHUNK_SIZE]
+            start_ts = chunk[0]["timestamp"]
+            end_ts = chunk[-1]["timestamp"]
+
+            table = pa.table(
+                {
+                    "image": pa.array([e["image"] for e in chunk], type=pa.binary()),
+                    "timestamp": pa.array(
+                        [e["timestamp"] for e in chunk], type=pa.float64()
+                    ),
+                    "mouse_x": pa.array(
+                        [e["mouse_x"] for e in chunk], type=pa.int32()
+                    ),
+                    "mouse_y": pa.array(
+                        [e["mouse_y"] for e in chunk], type=pa.int32()
+                    ),
+                    "mouse_left": pa.array(
+                        [e["mouse_left"] for e in chunk], type=pa.bool_()
+                    ),
+                    "mouse_right": pa.array(
+                        [e["mouse_right"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_w": pa.array(
+                        [e["key_w"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_a": pa.array(
+                        [e["key_a"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_s": pa.array(
+                        [e["key_s"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_d": pa.array(
+                        [e["key_d"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_space": pa.array(
+                        [e["key_space"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_shift": pa.array(
+                        [e["key_shift"] for e in chunk], type=pa.bool_()
+                    ),
+                    "key_ctrl": pa.array(
+                        [e["key_ctrl"] for e in chunk], type=pa.bool_()
+                    ),
+                }
+            )
+
+            name = f"events-{start_ts:.6f}-{end_ts:.6f}.parquet"
+            pq.write_table(table, self.data_dir / name)
