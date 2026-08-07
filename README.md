@@ -1,6 +1,6 @@
 # Visitor for Robox Rivals data
 
-**A utility for collecting data about the Roblox Rivals game, created using Vibecode.**
+**A utility for collecting Roblox Rivals data while you play, created with Vibecode.**
 
 ## How to use
 
