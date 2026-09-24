@@ -26,10 +26,14 @@ ui-recorder/
 ---
 
 ## Schema 
+and one json with screen width and height
+
 - image
 - timestamp
 - mouse_x
 - mouse_y
+- mouse_dx
+- mouse_dy
 - mouse_left
 - mouse_right
 - key_w
