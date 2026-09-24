@@ -1,4 +1,5 @@
 import io
+import json
 import time
 import threading
 from pathlib import Path
@@ -30,12 +31,15 @@ class Recorder:
         self._tick_thread: threading.Thread | None = None
         self._mouse_x: int = 0
         self._mouse_y: int = 0
+        self._prev_mouse_x: int | None = None
+        self._prev_mouse_y: int | None = None
         self._mouse_left: bool = False
         self._mouse_right: bool = False
         self._keys: dict[str, bool] = {}
 
     def start(self) -> Path:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._write_screen_json()
         self._running = True
 
         self._mouse_listener = mouse.Listener(
@@ -74,11 +78,21 @@ class Recorder:
     def _tick(self) -> None:
         ts = time.time()
         img_bytes = self._capture_screenshot()
+        if self._prev_mouse_x is None or self._prev_mouse_y is None:
+            dx = 0
+            dy = 0
+        else:
+            dx = self._mouse_x - self._prev_mouse_x
+            dy = self._mouse_y - self._prev_mouse_y
+        self._prev_mouse_x = self._mouse_x
+        self._prev_mouse_y = self._mouse_y
         event = {
             "image": img_bytes,
             "timestamp": ts,
             "mouse_x": self._mouse_x,
             "mouse_y": self._mouse_y,
+            "mouse_dx": dx,
+            "mouse_dy": dy,
             "mouse_left": self._mouse_left,
             "mouse_right": self._mouse_right,
             "key_w": self._keys.get("w", False),
@@ -104,6 +118,15 @@ class Recorder:
         buf = io.BytesIO()
         img.save(buf, format="WEBP", quality=85)
         return buf.getvalue()
+
+    def _write_screen_json(self) -> None:
+        monitor = self._sct.monitors[1]
+        payload = {
+            "width": monitor["width"],
+            "height": monitor["height"],
+        }
+        with open(self.data_dir / "screen.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f)
 
     def _on_mouse_move(self, x: int, y: int) -> None:
         self._mouse_x = x
@@ -162,6 +185,12 @@ class Recorder:
                     ),
                     "mouse_y": pa.array(
                         [e["mouse_y"] for e in chunk], type=pa.int32()
+                    ),
+                    "mouse_dx": pa.array(
+                        [e["mouse_dx"] for e in chunk], type=pa.int32()
+                    ),
+                    "mouse_dy": pa.array(
+                        [e["mouse_dy"] for e in chunk], type=pa.int32()
                     ),
                     "mouse_left": pa.array(
                         [e["mouse_left"] for e in chunk], type=pa.bool_()
